@@ -11,6 +11,9 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
 		vscode.commands.registerTextEditorCommand("llm-api-tutor-example.annotate", async (textEditor: vscode.TextEditor) => {
 
+			// clear out all text decorations in the current editor
+			textEditor.setDecorations(vscode.window.createTextEditorDecorationType({}), []);
+
 			const selection = textEditor.selection;
 			let chatResponse: vscode.LanguageModelChatResponse | undefined;
 
@@ -23,9 +26,34 @@ export function activate(context: vscode.ExtensionContext) {
 					return;
 				}
 
+				let selectedText = "";
+				let startLineNumber = 0;
+				let endLineNumber = 0;
+
+				// if there is no selection, select all the text in the viewable editor space
+				if (!selectedText) {
+					const fullRange = new vscode.Range(
+						textEditor.visibleRanges[0].start,
+						textEditor.visibleRanges[0].end
+					);
+					selectedText = textEditor.document.getText(fullRange);
+					startLineNumber = textEditor.visibleRanges[0].start.line + 1;
+					endLineNumber = textEditor.visibleRanges[0].end.line + 1;
+				}
+				else {
+					selectedText = textEditor.document.getText(selection);
+					startLineNumber = selection.start.line + 1;
+					endLineNumber = selection.end.line + 1;
+				}
+
+				const lines = selectedText.split("\n");
+				const linesWithNumbers = lines.map((line, index) => `${startLineNumber + index}: ${line}`);
+
+				const numberedCode = linesWithNumbers.join("\n");
+
 				const messages = [
-					vscode.LanguageModelChatMessage.User(`You are a code tutor who helps students learn how to write better code. Your job is to evaluate a block of code that the user gives you. You will then annotate any lines that could be improved with a brief suggestion. The "line" key should be the line number of the code that you are annotating, and the "message" key should be your suggestion. For example, if you wanted to suggest that the user change line 3 to use a for loop instead of a while loop, you would write: [{"line": 3, "message": "Consider using a for loop instead of a while loop."}]. If you have no suggestions, you can return an empty array. You will format your response as a simple text message where the line number is followed by a colon and then your suggestion. For example, "3: Consider using a for loop instead of a while loop. Separate each suggestion with a new line."`),
-					vscode.LanguageModelChatMessage.User(`Here is the code I would like you to evaluate: ${textEditor.document.getText(selection)}`),
+					vscode.LanguageModelChatMessage.User(`You are a code tutor who helps students learn how to write better code. Your job is to evaluate a block of code that the user gives you. You will then annotate any lines that could be improved with a brief suggestion. Each suggestion should end with a new line. If several lines need the same suggestion, you can combine those into a single suggestion by listing out the line numbers in your suggestion. Format your response so that you indicate a new suggestion with @ followed by the line number the suggestion applies to followed by a space followed by a message. Here is an example response: '@3 Imports should appear at the top of the file.'`),
+					vscode.LanguageModelChatMessage.User(`Here is the code I would like you to evaluate: ${numberedCode}`),
 				];
 
 				chatResponse = await model.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
@@ -39,29 +67,52 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 
 			try {
+				let isNewLine: boolean = false;
+				let annotationLineNumber = 0;
+				let annotation: string = "";
+
 				for await (const fragment of chatResponse.text) {
-					// parse out the line number and message from the fragment.
-					const [line, message] = fragment.split(": ");
-					const lineNumber = parseInt(line);
-					const decorationType = vscode.window.createTextEditorDecorationType({
-						after: {
-							contentText: message,
-							color: 'rgba(255, 0, 0, 0.5)'
+					// if the fragment is an @, this indicates a new line.
+					if (fragment === "@") {
+
+						// write the previous annotation as a message with a decoration at the end of the line
+						if (annotationLineNumber > 0) {
+							const lineLength = textEditor.document.lineAt(annotationLineNumber - 1).text.length;
+							const range = new vscode.Range(annotationLineNumber - 1, lineLength, annotationLineNumber - 1, lineLength);
+
+							// if the annotation is too long to fit on the line, truncate it and add the full message in a tooltip
+							const maxLength = 25;
+							const truncatedAnnotation = annotation.length > maxLength ? annotation.substring(0, maxLength) + "..." : annotation;
+
+							const decoration = {
+								range,
+								renderOptions: {
+									after: {
+										contentText: ` ${truncatedAnnotation}`,
+										color: "green"
+									}
+								},
+								hoverMessage: annotation
+							};
+							textEditor.setDecorations(vscode.window.createTextEditorDecorationType({}), [decoration]);
 						}
-					});
 
-					const decorations: vscode.DecorationOptions[] = [];
-					for (let i = selection.start.line; i <= selection.end.line; i++) {
-						const line = textEditor.document.lineAt(i);
-
-						decorations.push({
-							range: new vscode.Range(i, line.range.start.character, i, line.range.end.character)
-						});
+						isNewLine = true;
+						annotation = "";
+						continue;
 					}
 
-					textEditor.setDecorations(decorationType, decorations);
-				}
+					// if the previous fragment was an @, this fragment is a line number.
+					if (isNewLine) {
+						isNewLine = false;
 
+						annotationLineNumber = parseInt(fragment);
+						continue;
+					}
+
+					// otherwise, this fragment is part of the message for the line
+					annotation += fragment;
+				}
 			}
 			catch (err) {
 				console.log(err);
