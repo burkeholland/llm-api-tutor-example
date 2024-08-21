@@ -16,8 +16,22 @@
       {
         "command": "llm-api-tutor-example.annotate",
         "title": "Generate Tutor Annotations"
+      },
+      {
+        "command": "llm-api-tutor-example.clear",
+        "title": "Clear Tutor Annotations"
       }
-    ]
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "when": "editorFocus",
+          "command": "llm-api-tutor-example.annotate",
+          "alt": "Tutor",
+          "group": "navigation"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
