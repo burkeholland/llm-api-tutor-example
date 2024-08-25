@@ -5,6 +5,12 @@ import * as vscode from 'vscode';
 // Use gpt-4o since it is fast and high quality. gpt-3.5-turbo and gpt-4 are also available.
 const MODEL_SELECTOR: vscode.LanguageModelChatSelector = { vendor: 'copilot', family: 'gpt-4o' };
 
+const ANNOTATION_PROMPT = `
+You are a code tutor who helps students learn how to write better code.Your job is to evaluate a block of code that the user gives you.The user is writing You will then annotate any lines that could be improved with a brief suggestion and the reason why you are making that suggestion.Only make suggestions when you feel the severity is enough that it will impact the readibility and maintainability of the code.Be friendly with your suggestions and remember that these are students so they need gentle guidance.Format each suggestion as a single JSON object.It is not necessary to wrap your response in triple backticks.Here is an example of what your response should look like:
+
+{ "line": 1, "suggestion": "I think you should use a for loop instead of a while loop. A for loop is more concise and easier to read." } { "line": 12, "suggestion": "I think you should use a for loop instead of a while loop. A for loop is more concise and easier to read." }
+`;
+
 let decorations: vscode.TextEditorDecorationType[] = [];
 
 // This method is called when your extension is activated
@@ -12,9 +18,6 @@ let decorations: vscode.TextEditorDecorationType[] = [];
 export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
 		vscode.commands.registerTextEditorCommand("llm-api-tutor-example.annotate", async (textEditor: vscode.TextEditor) => {
-
-			// clear out all text decorations in the current editor
-			textEditor.setDecorations(vscode.window.createTextEditorDecorationType({}), []);
 
 			let chatResponse: vscode.LanguageModelChatResponse | undefined;
 
@@ -32,11 +35,32 @@ export function activate(context: vscode.ExtensionContext) {
 				const codeWithLineNumbers = await getCodeWithLineNumbers(textEditor);
 
 				const messages = [
-					vscode.LanguageModelChatMessage.User(`You are a code tutor who helps students learn how to write better code. Your job is to evaluate a block of code that the user gives you. The user is writing ${textEditor.document.languageId}. You will then annotate any lines that could be improved with a brief suggestion. Only make suggestions when you feel the severity is enough that it will impact the readibility and maintainability of the code. Each suggestion should end with a new line. If several lines need the same suggestion, you can combine those into a single suggestion by listing out the line numbers in your suggestion. Format your response so that you indicate a new suggestion with @ followed by the line number the suggestion applies to followed by a space followed by a message. Here is an example response: '@3 Imports should appear at the top of the file.' Sometimes you will have no suggestions in which case you can just return '@0 No suggestions.'`),
+					vscode.LanguageModelChatMessage.User(ANNOTATION_PROMPT),
+					vscode.LanguageModelChatMessage.User(`The user is coding in ${textEditor.document.languageId}.`),
 					vscode.LanguageModelChatMessage.User(`Here is the code I would like you to evaluate: ${codeWithLineNumbers}`),
 				];
 
 				chatResponse = await model.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
+
+				let accumulatedResponse = "";
+				for await (const fragment of chatResponse.text) {
+
+					// the accumulator holds the response until we get a complete line
+					accumulatedResponse += fragment;
+
+					// if the fragment is a }, we're at the end of a JSON object
+					if (fragment.includes("}")) {
+						try {
+							const annotation = JSON.parse(accumulatedResponse);
+							applyDecoration(textEditor, annotation.line, annotation.suggestion);
+							// reset the accumulator for the next line
+							accumulatedResponse = "";
+						}
+						catch (e) {
+							// do nothing
+						}
+					}
+				}
 			} catch (err) {
 				if (err instanceof vscode.LanguageModelError) {
 					console.log(err.message, err.code, err.cause);
@@ -44,15 +68,6 @@ export function activate(context: vscode.ExtensionContext) {
 					throw err;
 				}
 				return;
-			}
-
-			try {
-				if (chatResponse) {
-					await processChatResponseFragments(chatResponse, textEditor);
-				}
-			}
-			catch (err) {
-				console.log(err);
 			}
 		})
 	);
@@ -62,72 +77,40 @@ export function activate(context: vscode.ExtensionContext) {
 	}));
 }
 
-async function processChatResponseFragments(chatResponse: vscode.LanguageModelChatResponse, textEditor: vscode.TextEditor) {
-	let isNewLine: boolean = false;
-	let annotationLineNumber = 0;
-	let annotation: string = "";
-
-	let accumulatedResponse = "";
-
-	for await (const fragment of chatResponse.text) {
-		accumulatedResponse += fragment;
-
-		// Check if the accumulated response contains a complete suggestion
-		const suggestions = accumulatedResponse.split("\n");
-		for (let i = 0; i < suggestions.length - 1; i++) {
-			const suggestion = suggestions[i];
-			if (suggestion.startsWith('@')) {
-				const [lineNumber, ...messageParts] = suggestion.slice(1).split(' ');
-				const message = messageParts.join(' ');
-				const line = parseInt(lineNumber, 10);
-
-				if (line > 0) {
-					// Apply decoration to the editor
-					applyDecoration(textEditor, line, message);
-				}
-			}
-		}
-
-		// Keep the last incomplete suggestion in the accumulator
-		accumulatedResponse = suggestions[suggestions.length - 1];
+function getCodeWithLineNumbers(textEditor: vscode.TextEditor) {
+	let currentLine = textEditor.visibleRanges[0].start.line;
+	const endLine = textEditor.visibleRanges[0].end.line;
+	let code = '';
+	while (currentLine < endLine) {
+		code += `${currentLine + 1}: ${textEditor.document.lineAt(currentLine).text} \n`;
+		currentLine++;
 	}
+	return code;
 }
 
-async function getCodeWithLineNumbers(textEditor: vscode.TextEditor): Promise<string> {
-	let selectedText = "";
-	let startLineNumber = 0;
-	let endLineNumber = 0;
+function applyDecoration(editor: vscode.TextEditor, line: number, suggestion: string) {
 
-	const fullRange = new vscode.Range(
-		textEditor.visibleRanges[0].start,
-		textEditor.visibleRanges[0].end
-	);
-
-	selectedText = textEditor.document.getText(fullRange);
-	startLineNumber = textEditor.visibleRanges[0].start.line + 1;
-	endLineNumber = textEditor.visibleRanges[0].end.line + 1;
-
-	const lines = selectedText.split("\n");
-	const linesWithNumbers = lines.map((line, index) => `${startLineNumber + index}: ${line}`);
-
-	const numberedCode = linesWithNumbers.join("\n");
-
-	return numberedCode;
-}
-
-function applyDecoration(editor: vscode.TextEditor, line: number, message: string) {
 	const decorationType = vscode.window.createTextEditorDecorationType({
 		after: {
-			contentText: ` ${message}`, // Add a space before the message
+			contentText: ` ${suggestion.substring(0, 25) + "..."}`,
 			color: "grey",
 		},
 	});
 
+	// get the end of the line with the specified line number
 	const lineLength = editor.document.lineAt(line - 1).text.length;
-	const range = new vscode.Range(new vscode.Position(line - 1, lineLength), new vscode.Position(line - 1, lineLength));
-	editor.setDecorations(decorationType, [range]);
+	const range = new vscode.Range(
+		new vscode.Position(line - 1, lineLength),
+		new vscode.Position(line - 1, lineLength),
+	);
 
-	// store the decoration so we can clear it later
+	const decoration = { range: range, hoverMessage: suggestion };
+
+	vscode.window.activeTextEditor?.setDecorations(decorationType, [
+		decoration,
+	]);
+
+	// keep track of the decorations so we can remove them later
 	decorations.push(decorationType);
 }
 
